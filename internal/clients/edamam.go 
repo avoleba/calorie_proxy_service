@@ -1,0 +1,176 @@
+package clients
+
+import (
+    "encoding/json"
+    "fmt"
+    "net/http"
+    "net/url"
+    "strings"
+    "time"
+
+    "calorie-proxy/internal/models"
+)
+
+type EdamamClient struct {
+    httpClient *http.Client
+    appID      string
+    appKey     string
+    baseURL    string
+}
+
+func NewEdamamClient(appID, appKey string) *EdamamClient {
+    return &EdamamClient{
+        httpClient: &http.Client{
+            Timeout: 10 * time.Second,
+        },
+        appID:   appID,
+        appKey:  appKey,
+        baseURL: "https://api.edamam.com/api",
+    }
+}
+
+// SearchFoods - поиск продуктов в базе Edamam
+func (c *EdamamClient) SearchFoods(query string, page, pageSize int) ([]models.FoodItem, int, error) {
+    url := fmt.Sprintf("%s/food-database/v2/parser?app_id=%s&app_key=%s&ingr=%s&page=%d",
+        c.baseURL, c.appID, c.appKey, url.QueryEscape(query), page)
+
+    req, err := http.NewRequest("GET", url, nil)
+    if err != nil {
+        return nil, 0, fmt.Errorf("failed to create request: %w", err)
+    }
+
+    resp, err := c.httpClient.Do(req)
+    if err != nil {
+        return nil, 0, fmt.Errorf("failed to make request: %w", err)
+    }
+    defer resp.Body.Close()
+
+    if resp.StatusCode != http.StatusOK {
+        return nil, 0, fmt.Errorf("API returned status %d", resp.StatusCode)
+    }
+
+    var result struct {
+        Text     string `json:"text"`
+        Parsed   []interface{} `json:"parsed"`
+        Hints    []struct {
+            Food struct {
+                FoodID      string `json:"foodId"`
+                Label       string `json:"label"`
+                Brand       string `json:"brand"`
+                Category    string `json:"category"`
+                FoodContentsLabel string `json:"foodContentsLabel"`
+                Image       string `json:"image"`
+            } `json:"food"`
+            Measures []interface{} `json:"measures"`
+        } `json:"hints"`
+    }
+
+    if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+        return nil, 0, fmt.Errorf("failed to decode response: %w", err)
+    }
+
+    items := make([]models.FoodItem, 0, len(result.Hints))
+    for _, hint := range result.Hints {
+        // Для получения детальной информации нужно сделать отдельный запрос
+        // или использовать другой эндпоинт
+        items = append(items, models.FoodItem{
+            ID:       hint.Food.FoodID,
+            Name:     hint.Food.Label,
+            Brand:    hint.Food.Brand,
+            Category: hint.Food.Category,
+            ImageURL: hint.Food.Image,
+            Source:   "edamam",
+        })
+    }
+
+    return items, len(items), nil
+}
+
+// AnalyzeRecipe - анализ рецепта/блюда по ингредиентам [citation:10]
+func (c *EdamamClient) AnalyzeRecipe(ingredients []string, title string) (*models.NutritionAnalysisResponse, error) {
+    url := fmt.Sprintf("%s/nutrition-details?app_id=%s&app_key=%s",
+        c.baseURL, c.appID, c.appKey)
+
+    // Формируем тело запроса
+    requestBody := map[string]interface{}{
+        "title": title,
+        "ingr":  ingredients,
+    }
+
+    jsonBody, _ := json.Marshal(requestBody)
+
+    req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonBody))
+    if err != nil {
+        return nil, fmt.Errorf("failed to create request: %w", err)
+    }
+    req.Header.Set("Content-Type", "application/json")
+
+    resp, err := c.httpClient.Do(req)
+    if err != nil {
+        return nil, fmt.Errorf("failed to make request: %w", err)
+    }
+    defer resp.Body.Close()
+
+    if resp.StatusCode != http.StatusOK {
+        return nil, fmt.Errorf("API returned status %d", resp.StatusCode)
+    }
+
+    var result struct {
+        URI         string  `json:"uri"`
+        Yield       int     `json:"yield"`
+        Calories    float64 `json:"calories"`
+        TotalWeight float64 `json:"totalWeight"`
+        DietLabels  []string `json:"dietLabels"`
+        TotalNutrients map[string]struct {
+            Label    string  `json:"label"`
+            Quantity float64 `json:"quantity"`
+            Unit     string  `json:"unit"`
+        } `json:"totalNutrients"`
+        Ingredients []struct {
+            Text         string `json:"text"`
+            Parsed       []interface{} `json:"parsed"`
+        } `json:"ingredients"`
+    }
+
+    if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+        return nil, fmt.Errorf("failed to decode response: %w", err)
+    }
+
+    // Извлекаем основные нутриенты
+    getNutrient := func(key string) float64 {
+        if nutrient, ok := result.TotalNutrients[key]; ok {
+            return nutrient.Quantity
+        }
+        return 0
+    }
+
+    totalNutrients := models.NutritionInfo{
+        Calories:      result.Calories,
+        Protein:       getNutrient("PROCNT"),
+        Fat:           getNutrient("FAT"),
+        Carbohydrates: getNutrient("CHOCDF"),
+        Fiber:         getNutrient("FIBTG"),
+    }
+
+    // Рассчитываем на порцию
+    perServing := models.NutritionInfo{
+        Calories:      result.Calories / float64(result.Yield),
+        Protein:       getNutrient("PROCNT") / float64(result.Yield),
+        Fat:           getNutrient("FAT") / float64(result.Yield),
+        Carbohydrates: getNutrient("CHOCDF") / float64(result.Yield),
+        Fiber:         getNutrient("FIBTG") / float64(result.Yield),
+    }
+
+    response := &models.NutritionAnalysisResponse{
+        Title:          title,
+        TotalWeight:    result.TotalWeight,
+        Yield:          result.Yield,
+        Calories:       result.Calories,
+        TotalNutrients: totalNutrients,
+        PerServing:     perServing,
+        Ingredients:    []models.FoodItem{}, // здесь можно добавить детали
+        Timestamp:      time.Now(),
+    }
+
+    return response, nil
+}
